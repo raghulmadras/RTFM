@@ -77,6 +77,12 @@ restart: ## Restart the bot
 logs: ## View bot logs (live)
 	docker-compose logs -f bot
 
+logs-processor: ## View message processor logs (live)
+	docker-compose logs -f message-processor
+
+logs-all: ## View all service logs (live)
+	docker-compose logs -f
+
 logs-tail: ## View last 100 log lines
 	docker-compose logs --tail=100 bot
 
@@ -125,9 +131,21 @@ clean-logs: ## Remove log files
 
 test-connection: ## Test if bot can connect
 	@echo "${BLUE}Testing bot connection...${NC}"
-	@docker-compose logs bot | grep "We have logged in as" && \
+	@docker-compose logs bot | grep "Logged in as" && \
 		echo "${GREEN}✓ Bot is connected!${NC}" || \
 		echo "${YELLOW}Bot not connected yet. Check logs with 'make logs'${NC}"
+
+test-kafka: ## Test Kafka integration
+	@echo "${BLUE}Testing Kafka integration...${NC}"
+	docker-compose exec message-processor python test_kafka.py --bootstrap-servers kafka:9092 --test all
+
+init-topics: ## Initialize Kafka topics manually
+	@echo "${BLUE}Initializing Kafka topics...${NC}"
+	docker-compose exec message-processor python init_kafka_topics.py --bootstrap-servers kafka:9092 --action create
+
+list-topics: ## List all Kafka topics
+	@echo "${BLUE}Listing Kafka topics...${NC}"
+	docker-compose exec kafka kafka-topics --bootstrap-server localhost:9092 --list
 
 # ============================================================================
 # QUICK START

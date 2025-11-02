@@ -50,6 +50,16 @@ ENV PATH="/opt/venv/bin:$PATH"
 # Copy application files
 COPY bot.py .
 COPY database.py .
+COPY kafka_producer.py .
+COPY kafka_consumer.py .
+COPY message_processor.py .
+COPY schemas.py .
+COPY init_kafka_topics.py .
+COPY test_kafka.py .
+COPY entrypoint.sh .
+
+# Make entrypoint executable
+RUN chmod +x entrypoint.sh
 
 # Create directories for database and logs
 RUN mkdir -p /app/discord_db /app/logs
@@ -58,5 +68,8 @@ RUN mkdir -p /app/discord_db /app/logs
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD python -c "import sys; sys.exit(0)"
 
-# Run the bot
-CMD ["python", "-u", "bot.py"]
+# Set entrypoint
+ENTRYPOINT ["/app/entrypoint.sh"]
+
+# Default command
+CMD ["bot.py"]

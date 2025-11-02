@@ -21,20 +21,41 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: rtfm-bot
+    command: python bot.py
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN}
-      GEMINI_API_KEY: ${GEMINI_API_KEY}
-      GEMINI_API_SECRET: ${GEMINI_API_SECRET}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     volumes:
-      - ./discord_db:/app/discord_db
       - ./logs:/app/logs
     restart: unless-stopped
+    depends_on:
+      - kafka
+      - message-processor
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+    networks:
+      - rtfm-network
+
+  message-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rtfm-message-processor
+    command: python message_processor.py
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    volumes:
+      - ./discord_db:/app/discord_db
+      - ./logs:/app/logs
+    restart: unless-stopped
+    depends_on:
+      - kafka
+      - chroma
     networks:
       - rtfm-network
 

@@ -2,130 +2,181 @@ import os
 import discord
 from datetime import datetime
 from dotenv import load_dotenv
-from database import Database
-import google.generativeai as genai
 import asyncio
+import uuid
+import logging
+from kafka_producer import RTFMKafkaProducer
+from kafka_consumer import BotResponseConsumer
+import threading
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 class DiscordRTFMBot:
     TRIGGER_PHRASE = ["rtfm", "RTFM", "Rtfm", "Read The F***ing Manual"]
 
 
-    def __init__(self, bot_token, gemini_api_key, gemini_api_secret):
-        # Load tokens and configure Gemini API
+    def __init__(self, bot_token, kafka_bootstrap_servers="kafka:9092"):
+        # Load tokens
         self.BOT_TOKEN = bot_token
-        self.GEMINI_API_KEY = gemini_api_key
-        self.GEMINI_API_SECRET = gemini_api_secret
-        genai.configure(api_key=self.GEMINI_API_KEY)
-        self.model = genai.GenerativeModel('gemini-2.5-flash')
 
-
-        # Initialize database
-        self.db = Database()
-
+        # Initialize Kafka producer
+        self.kafka_producer = RTFMKafkaProducer(kafka_bootstrap_servers)
 
         # Discord client
         intents = discord.Intents.default()
         intents.message_content = True
         self.client = discord.Client(intents=intents)
 
+        # Channel references for sending responses
+        self.channels = {}
+
+        # Pending queries (to track responses)
+        self.pending_queries = {}
+
+        # Start response consumer in background
+        self.response_consumer = BotResponseConsumer(kafka_bootstrap_servers)
+        self.response_thread = self.response_consumer.consume_async(
+            self.handle_bot_response,
+            self.handle_consumer_error
+        )
 
         # Register events
         self.client.event(self.on_ready)
         self.client.event(self.on_message)
 
 
-    async def generate_response(self, question):
+    def handle_bot_response(self, response: dict):
         """
-        Generate a response using Chroma database results and Gemini API
+        Handle bot responses from Kafka
+
+        This is called by the Kafka consumer when a response is ready.
         """
         try:
-            # Query the database for relevant messages
-            query_results = self.db.query(question, k=10, min_confidence=0.3, max_results=5)
-           
-            if not query_results:
-                return "I couldn't find any relevant information in the chat history to answer your question."
-           
-            # Prepare context from database results
-            context = ""
-            for content, metadata, confidence in query_results:
-                context += f"[{metadata['date']}] {metadata['username']}: {content}\n"
-           
-            # Create prompt for Gemini
-            prompt = f"""Based on the following Discord chat history, please answer the question: "{question}"
+            channel_id = int(response['channel_id'])
+            response_text = response['response_text']
 
+            logger.info(f"Received response for channel {channel_id}")
 
-Chat History:
-{context}
+            # Schedule sending the message in the Discord event loop
+            asyncio.run_coroutine_threadsafe(
+                self._send_response(channel_id, response_text),
+                self.client.loop
+            )
 
-
-Please provide a helpful and accurate response based on the information available in the chat history. If the information is insufficient, say so clearly."""
-           
-            # Generate response using Gemini
-            response = self.model.generate_content(prompt)
-            return response.text
-           
         except Exception as e:
-            print(f"Error generating response: {e}")
-            return "Sorry, I encountered an error while trying to answer your question."
+            logger.error(f"Error handling bot response: {e}", exc_info=True)
+
+    async def _send_response(self, channel_id: int, response_text: str):
+        """
+        Send a response to a Discord channel
+
+        Args:
+            channel_id: Discord channel ID
+            response_text: Response text to send
+        """
+        try:
+            channel = self.client.get_channel(channel_id)
+            if channel:
+                await channel.send(response_text)
+                logger.info(f"Sent response to channel {channel_id}")
+            else:
+                logger.error(f"Channel {channel_id} not found")
+        except Exception as e:
+            logger.error(f"Error sending response to channel {channel_id}: {e}")
+
+    def handle_consumer_error(self, error: Exception):
+        """Handle errors from the Kafka consumer"""
+        logger.error(f"Kafka consumer error: {error}", exc_info=True)
 
 
     async def on_ready(self):
-        print(f'We have logged in as {self.client.user}')
+        logger.info(f'Logged in as {self.client.user}')
 
 
     async def on_message(self, message):
         if message.author == self.client.user:
             return
 
+        try:
+            # Get message details
+            message_creation_time = message.created_at
+            formatted_time = message_creation_time.isoformat()
 
-        # Store message in database
-        message_creation_time = message.created_at
-        formatted_time = message_creation_time.strftime("%Y-%m-%d %H:%M:%S UTC")
-        self.db.add_message(
-            content=message.content,
-            username=str(message.author),
-            date=formatted_time
-        )
-        print(f"[{formatted_time}] [{message.channel}] {message.author}: {message.content}", flush=True)
-        print(f"Message stored in database: {message.content[:50]}...", flush=True)
+            # Send message to discord-messages topic
+            message_data = {
+                "message_id": str(message.id),
+                "content": message.content,
+                "username": str(message.author),
+                "user_id": str(message.author.id),
+                "channel_id": str(message.channel.id),
+                "timestamp": formatted_time,
+                "metadata": {
+                    "channel_name": message.channel.name if hasattr(message.channel, 'name') else "DM"
+                }
+            }
 
+            self.kafka_producer.send_discord_message(message_data)
+            logger.info(
+                f"[{formatted_time}] [{message.channel}] {message.author}: "
+                f"{message.content[:50]}..."
+            )
 
-        # Check for trigger phrase
-        if any(phrase.lower() in message.content.lower() for phrase in self.TRIGGER_PHRASE):
-            print(f"Trigger phrase detected in message: {message.content}", flush=True)
-           
-            # Remove trigger phrase to extract question
-            question = message.content
-            for phrase in self.TRIGGER_PHRASE:
-                question = question.replace(phrase, "").strip()
-           
-            if question:
-                print(f"Generating response for question: {question}", flush=True)
-                response = await self.generate_response(question)
-                if len(response)==0:
-                    await message.channel.send("Please Ask A Question That Has Been Talked About Before.")
-                await message.channel.send(response)
-            else:
-                await message.channel.send(
-                    "Please ask a specific question after the trigger phrase so I can help you find relevant information from the chat history."
-                )
+            # Check for trigger phrase
+            if any(phrase.lower() in message.content.lower() for phrase in self.TRIGGER_PHRASE):
+                logger.info(f"Trigger phrase detected in message: {message.content}")
+
+                # Remove trigger phrase to extract question
+                question = message.content
+                for phrase in self.TRIGGER_PHRASE:
+                    question = question.replace(phrase, "").strip()
+
+                if question:
+                    # Send query to bot-queries topic
+                    query_id = str(uuid.uuid4())
+                    query_data = {
+                        "query_id": query_id,
+                        "original_message_id": str(message.id),
+                        "question": question,
+                        "username": str(message.author),
+                        "user_id": str(message.author.id),
+                        "channel_id": str(message.channel.id),
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "context": {}
+                    }
+
+                    self.kafka_producer.send_bot_query(query_data)
+                    logger.info(f"Sent query to Kafka: {question}")
+
+                else:
+                    await message.channel.send(
+                        "Please ask a specific question after the trigger phrase so I can help you find relevant information from the chat history."
+                    )
+
+        except Exception as e:
+            logger.error(f"Error processing message: {e}", exc_info=True)
 
 
     def run(self):
-        self.client.run(self.BOT_TOKEN)
-
-
+        try:
+            self.client.run(self.BOT_TOKEN)
+        finally:
+            # Cleanup
+            self.response_consumer.stop()
+            self.kafka_producer.close()
+            logger.info("Bot shutdown complete")
 
 
 if __name__ == "__main__":
     # Load environment variables
     load_dotenv()
     BOT_TOKEN = os.getenv("DISCORD_TOKEN")
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    GEMINI_API_SECRET = os.getenv("GEMINI_API_SECRET")
+    KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 
-
-    bot = DiscordRTFMBot(BOT_TOKEN, GEMINI_API_KEY, GEMINI_API_SECRET)
+    bot = DiscordRTFMBot(BOT_TOKEN, KAFKA_BOOTSTRAP_SERVERS)
     bot.run()
 
