@@ -27,3 +27,6 @@ numpy==1.26.2
 
 # Kafka Integration
 kafka-python==2.0.2
+
+# Adding Redis
+redis>=5.0.0
