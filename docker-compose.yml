@@ -82,6 +82,11 @@ services:
       - redis_data:/data
     command: redis-server --appendonly yes
     restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     networks:
       - rtfm-network
 
