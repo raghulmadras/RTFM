@@ -14,6 +14,9 @@ import sys
 from datetime import datetime
 from typing import Optional
 import uuid
+import redis
+from cache_warmer import CacheWarmer
+from cache_monitor import CacheMonitor
 
 from database import Database
 from kafka_consumer import DiscordMessageConsumer, BotQueryConsumer, MultiConsumerManager
@@ -28,6 +31,43 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Initialize Redis
+redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+
+# Initialize cache warmer and monitor
+cache_warmer = CacheWarmer(redis_client, your_vector_search_function)
+cache_monitor = CacheMonitor(redis_client)
+
+# On startup, warm the cache
+async def on_startup():
+    server_id = "YOUR_SERVER_ID"  # Get from config
+    
+    # Warm cache immediately
+    cache_warmer.warm_cache_on_startup(server_id)
+    
+    # Start periodic refresh in background
+    asyncio.create_task(cache_warmer.periodic_cache_refresh(server_id, interval_minutes=30))
+
+# When handling search queries
+def handle_search_query(query: str, server_id: str):
+    query_hash = hashlib.md5(query.lower().encode()).hexdigest()
+    cache_key = f"query:{server_id}:{query_hash}"
+    
+    # Try to get from cache
+    cached_result = redis_client.get(cache_key)
+    
+    if cached_result:
+        cache_monitor.record_hit()
+        return json.loads(cached_result)
+    
+    # Cache miss - perform search
+    cache_monitor.record_miss()
+    results = perform_vector_search(query, server_id)
+    
+    # Store in cache
+    redis_client.setex(cache_key, 3600, json.dumps(results))
+    
+    return results
 
 class MessageProcessor:
     """
